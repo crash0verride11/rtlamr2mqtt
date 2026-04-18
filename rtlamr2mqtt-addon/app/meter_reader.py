@@ -11,6 +11,10 @@ import helpers.usb_utils as usbutil
 
 logger = logging.getLogger('rtlamr2mqtt')
 
+# If rtlamr produces no output for this many seconds while the process is still
+# alive, declare it stuck and restart both rtlamr and rtl_tcp.
+_STUCK_TIMEOUT = 600  # 10 minutes
+
 
 class MeterReader:
     """
@@ -47,7 +51,30 @@ class MeterReader:
 
             # Read until shutdown or all meters seen (when sleep_for > 0)
             while not self.shutdown_event.is_set():
-                line = await self.rtlamr.read_line()
+                try:
+                    line = await asyncio.wait_for(
+                        self.rtlamr.read_line(),
+                        timeout=_STUCK_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        'No output from rtlamr for %ds — process appears stuck, restarting',
+                        _STUCK_TIMEOUT,
+                    )
+                    await self.rtlamr.stop()
+                    if not self.is_remote:
+                        await self.rtltcp.stop()
+                        if not await self.rtltcp.start_with_retry():
+                            logger.error('Failed to restart rtl_tcp after stuck rtlamr, shutting down')
+                            self.shutdown_event.set()
+                            return
+                        await usbutil.tickle_rtl_tcp(self.rtltcp_host)
+                        await asyncio.sleep(1.0)
+                    if not await self.rtlamr.start_with_retry():
+                        logger.error('Failed to restart rtlamr after stuck timeout, shutting down')
+                        self.shutdown_event.set()
+                        return
+                    continue
 
                 if line is None:
                     # Process died or stdout closed
@@ -55,6 +82,16 @@ class MeterReader:
                         break
                     if not self.rtlamr.is_alive:
                         logger.warning('rtlamr process died, attempting restart')
+                        # rtl_tcp exits when its client (rtlamr) disconnects.
+                        # Restart rtl_tcp first if it also went down.
+                        if not self.is_remote and not self.rtltcp.is_alive:
+                            logger.warning('rtl_tcp also died, restarting both')
+                            if not await self.rtltcp.start_with_retry():
+                                logger.error('Failed to restart rtl_tcp, shutting down')
+                                self.shutdown_event.set()
+                                return
+                            await usbutil.tickle_rtl_tcp(self.rtltcp_host)
+                            await asyncio.sleep(1.0)
                         if not await self.rtlamr.start_with_retry():
                             logger.error('Failed to restart rtlamr, shutting down')
                             self.shutdown_event.set()
@@ -131,18 +168,54 @@ class MeterReader:
 
         logger.info('Waking up, restarting processes')
 
-        # Restart rtl_tcp first (if local)
-        if not self.is_remote:
-            if not await self.rtltcp.start_with_retry():
-                logger.error('Failed to restart rtl_tcp after sleep, shutting down')
-                self.shutdown_event.set()
-                return
+        # The tickle can cause rtl_tcp to exit on some hardware. If rtlamr then
+        # fails to connect, restart rtl_tcp and retry rather than giving up.
+        _MAX_WAKE_ATTEMPTS = 3
+        for attempt in range(1, _MAX_WAKE_ATTEMPTS + 1):
+            logger.info('Wake attempt %d/%d', attempt, _MAX_WAKE_ATTEMPTS)
 
-        # Tickle rtl_tcp to wake up the receiver
-        usbutil.tickle_rtl_tcp(self.rtltcp_host)
+            # Restart rtl_tcp first (if local)
+            if not self.is_remote:
+                if not await self.rtltcp.start_with_retry():
+                    logger.error('Failed to restart rtl_tcp after sleep, shutting down')
+                    self.shutdown_event.set()
+                    return
+                logger.debug('rtl_tcp alive after start: %s', self.rtltcp.is_alive)
 
-        # Restart rtlamr
-        if not await self.rtlamr.start_with_retry():
-            logger.error('Failed to restart rtlamr after sleep, shutting down')
-            self.shutdown_event.set()
-            return
+            # Tickle rtl_tcp to wake up the receiver
+            logger.debug('Tickling rtl_tcp at %s', self.rtltcp_host)
+            await usbutil.tickle_rtl_tcp(self.rtltcp_host)
+
+            # Brief pause so rtl_tcp can die (if the tickle kills it) before we
+            # check whether it is still alive and before rtlamr tries to connect.
+            await asyncio.sleep(1.0)
+
+            # If rtl_tcp exited after the tickle, loop back and restart it.
+            if not self.is_remote:
+                logger.debug('rtl_tcp alive after tickle+1s: %s', self.rtltcp.is_alive)
+                if not self.rtltcp.is_alive:
+                    logger.warning(
+                        'rtl_tcp exited after tickle (attempt %d/%d), restarting...',
+                        attempt, _MAX_WAKE_ATTEMPTS,
+                    )
+                    continue
+
+            # Restart rtlamr
+            logger.debug('Starting rtlamr (attempt %d/%d)', attempt, _MAX_WAKE_ATTEMPTS)
+            if await self.rtlamr.start_with_retry():
+                logger.info('Processes restarted successfully on wake attempt %d', attempt)
+                return  # success — back to the main reading loop
+
+            # rtlamr failed even though rtl_tcp looked alive.  Log rtl_tcp state
+            # to help diagnose whether it crashed between the check and rtlamr's
+            # first connection attempt, or whether rtlamr timed out for another reason.
+            rtltcp_alive = self.rtltcp.is_alive if not self.is_remote else 'n/a (remote)'
+            logger.warning(
+                'rtlamr failed to start (attempt %d/%d); rtl_tcp alive=%s — restarting rtl_tcp...',
+                attempt, _MAX_WAKE_ATTEMPTS, rtltcp_alive,
+            )
+            if not self.is_remote:
+                await self.rtltcp.stop()
+
+        logger.error('Failed to restart processes after sleep, shutting down')
+        self.shutdown_event.set()

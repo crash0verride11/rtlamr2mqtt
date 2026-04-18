@@ -76,22 +76,35 @@ class ManagedProcess:
             return False
 
         # Wait for ready pattern with timeout
+        startup_lines: list[str] = []
         try:
             ready = await asyncio.wait_for(
-                self._wait_for_ready(),
+                self._wait_for_ready(startup_lines),
                 timeout=self.ready_timeout,
             )
             if ready:
                 logger.info('%s is ready', self.name)
             return ready
         except asyncio.TimeoutError:
-            logger.error('%s did not become ready within %.1fs', self.name, self.ready_timeout)
+            logger.error(
+                '%s did not become ready within %.1fs (waiting for %r)',
+                self.name, self.ready_timeout, self.ready_pattern,
+            )
+            if startup_lines:
+                logger.error(
+                    '%s last output before timeout:\n  %s',
+                    self.name, '\n  '.join(startup_lines[-20:]),
+                )
+            else:
+                logger.error('%s produced no output before timeout', self.name)
             await self.stop()
             return False
 
-    async def _wait_for_ready(self) -> bool:
+    async def _wait_for_ready(self, startup_lines: list[str]) -> bool:
         """
         Read stdout lines until the ready pattern is found or the process exits.
+        Lines are appended to startup_lines so the caller can inspect them on
+        timeout.
         """
         while True:
             if self._process.stdout is None:
@@ -106,6 +119,7 @@ class ManagedProcess:
 
             line = line_bytes.decode('utf-8', errors='replace').strip()
             if line:
+                startup_lines.append(line)
                 logger.debug('%s: %s', self.name, line)
             if self.ready_pattern in line:
                 return True
@@ -128,14 +142,22 @@ class ManagedProcess:
             # Signal the entire process group (includes stdbuf child)
             os.killpg(self._process.pid, signal.SIGTERM)
             try:
-                await asyncio.wait_for(self._process.wait(), timeout=2.0)
+                await asyncio.wait_for(self._process.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 logger.warning('%s did not exit after SIGTERM, sending SIGKILL', self.name)
                 try:
                     os.killpg(self._process.pid, signal.SIGKILL)
                 except (ProcessLookupError, BrokenPipeError):
                     self._process.kill()
-                await self._process.wait()
+                # Cap post-SIGKILL wait; a process in kernel D-state (stuck I/O)
+                # will never exit.
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.error(
+                        '%s did not die after SIGKILL — may be stuck in kernel D-state. Continuing shutdown.',
+                        self.name,
+                    )
         except (ProcessLookupError, BrokenPipeError):
             pass  # Already dead
 
